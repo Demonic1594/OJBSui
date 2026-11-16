@@ -33,11 +33,16 @@ local Mouse = LP:GetMouse()
 -- 2. CONSTANTS & CONFIG
 -- ================================================================
 local USE_EMOJI = true
+-- MAX_TICK caps casts per slot per Heartbeat frame. 800/slot/frame × 60fps
+-- = 48,000/s/slot. With multiple slots, total can exceed 200,000/s.
+-- Realistic ceilings before remote-flood kicks: ~200-500/s combined.
+-- Leave the value at 800 as a safety valve for edge cases, but document
+-- in the Guide tab that rates above 100/s are likely to get the user kicked.
 local MAX_TICK = 800
 local MAX_INFLIGHT = 128
 local IS_MOBILE = UIS.TouchEnabled and not UIS.MouseEnabled
 
-local AL_PREFIX = "AwakenedLimitless"  
+local AL_PREFIX = "AwakenedLimitless"  -- 17 chars; never hardcode the length
 
 local STATE_FILE = "OJBS_STATE_" .. tostring(game.PlaceId) .. ".json"
 local LIB_FILE = "OJBS_LIB.json"
@@ -48,9 +53,9 @@ local DEFAULT_REMOTES = {
 }
 
 -- Remote reminder timing (seconds)
-local REMOTE_REMINDER_GRACE    = 5    
-local REMOTE_REMINDER_CHECK    = 2.5  
-local REMOTE_REMINDER_INTERVAL = 15   
+local REMOTE_REMINDER_GRACE    = 5    -- delay after boot before first check
+local REMOTE_REMINDER_CHECK    = 2.5  -- how often to poll resolution
+local REMOTE_REMINDER_INTERVAL = 15   -- minimum gap between reminder toasts
 
 -- ================================================================
 -- 3. FORWARD DECLARATIONS (shared across sections)
@@ -66,10 +71,15 @@ local _refreshListenStatus = nil
 local _rebuildMovesList = nil
 local openLibDetail = nil
 
+-- Token used to cancel in-flight reminder loops (bump to invalidate)
 local _remoteReminderToken = 0
+-- Token used to cancel the hook-status poller (bump to invalidate)
 local _statusLoopToken = 0
+-- skillId -> os.clock() expiry. Marks skills WE fired, so the namecall
+-- hook can skip recording them on executors without checkcaller().
 local OWN_FIRE_MARK = {}
 
+-- M1 and snapshotSlot are used by writeState (§4) but assigned in §7.
 local M1
 local snapshotSlot
 
@@ -169,6 +179,12 @@ end
 -- ================================================================
 -- 5. UTILITIES
 -- ================================================================
+-- A resolved remote can still be destroyed later (Parent == nil), which
+-- makes InvokeServer silently error forever. Treat that as unresolved.
+-- NOTE: Luau's type() returns "userdata" for Instances, not "Instance" —
+-- typeof() is the correct check. We sidestep both by checking .Parent
+-- directly on non-nil, which works for any Instance regardless of how
+-- the executor customizes type/typeof.
 local function remoteAlive(r)
     return r ~= nil and r.Parent ~= nil
 end
@@ -266,9 +282,15 @@ end
 local _cachedSelfModel = nil
 local _cachedSelfAt = 0
 local SELF_CACHE_TTL = 3
+-- OPTIMIZED (perf-pass): negative cache — after a failed self-scan, don't
+-- retry (and don't re-run the Workspace:GetDescendants() fallback) for
+-- SELF_MISS_TTL seconds, so unresolvable self stops costing a full
+-- workspace scan per frame per slot. Reset on respawn below.
 local _selfMissAt = 0
 local SELF_MISS_TTL = 0.5
 
+-- Boundary-safe name match: "Bob" matches "Bob", "Bob_Server" and
+-- "Bob_<anything>" but NOT "Bobby_Server".
 local function matchesPlayerName(modelName, pn)
     if not (type(modelName) == "string" and type(pn) == "string") or pn == "" then return false end
     if modelName == pn or modelName == pn .. "_Server" then return true end
@@ -415,6 +437,9 @@ local function findOwnModelImpl()
     return nil, "none"
 end
 
+-- OPTIMIZED (perf-pass): negative cache — early-return nil for SELF_MISS_TTL
+-- after a miss, so Heartbeat callers stop re-scanning every frame. Tuple
+-- shape unchanged: always returns (model|nil, method-string).
 local function findOwnModel()
     if _cachedSelfModel and _cachedSelfModel.Parent
        and (os.clock() - _cachedSelfAt) < SELF_CACHE_TTL
@@ -504,6 +529,8 @@ snapshotSlot = function(s)
     }
 end
 
+-- Whitelists mirroring the UI Cycle options, so a stale/corrupt save can
+-- never leave the slot holding a value the cycle widget can't display.
 local SLOT_ORIGINS  = { "Target (ground)", "Target", "Self (ground)", "Self" }
 local SLOT_ARGMODES = { "targets", "none", "1,1" }
 local function inList(v, list)
@@ -567,6 +594,12 @@ local function rebindRemotes(silent)
     end
 end
 
+-- Background reminder: check every REMOTE_REMINDER_CHECK seconds whether
+-- both remotes resolve (a destroyed remote counts as unresolved). Auto-
+-- retries resolution each check. Shows a red toast at REMOTE_REMINDER_
+-- INTERVAL cadence while unresolved. Stops reminding as soon as they
+-- resolve; shows a one-time "resolved" toast if it had reminded before.
+-- Token-based so it can be cancelled.
 local function startRemoteReminder()
     _remoteReminderToken += 1
     local myToken = _remoteReminderToken
@@ -687,6 +720,7 @@ end
 
 loadState()
 
+-- Restore the Moves list + rate (persisted alongside slots).
 if type(STATE.moves) == "table" then
     if tonumber(STATE.moves.rate) then
         M1.moves.rate = math.max(1, math.floor(tonumber(STATE.moves.rate)))
@@ -707,6 +741,7 @@ end
 rebindRemotes(true)
 print("[OJBS-app] state + library loaded")
 
+-- Start the remote reminder if the user hasn't silenced it
 if STATE.remoteReminders ~= false then
     startRemoteReminder()
 end
@@ -840,6 +875,8 @@ local function installHook()
             if ListenOn then
                 local okm, method = pcall(getnamecallmethod)
                 if okm and isServerCallMethod(method) then
+                    -- NOTE: avoid type(self) == "Instance" — Luau's type() returns
+                    -- "userdata" for Instances; check .Name directly instead.
                     local remoteName = self ~= nil and self.Name or nil
                     local isSkillRemote = (self == SkillRemote) or (remoteName == "StartSkilll_Method")
                     local isOtherTarget = STATE.captureAll and not isNoisyRemote(self)
@@ -872,6 +909,8 @@ local function installHook()
                                     local cok, c = pcall(checkcaller)
                                     isOurs = cok and c or false
                                 end
+                                -- Fallback for executors without checkcaller:
+                                -- skip skills we fired ourselves recently.
                                 if not isOurs then
                                     local mark = OWN_FIRE_MARK[skillId]
                                     isOurs = mark ~= nil and os.clock() < mark
@@ -919,6 +958,12 @@ local function armPick(cb, label)
     OJBS:Notify(label or "click a player", Color3.fromRGB(64, 152, 255))
 end
 
+-- OPTIMIZED (perf-pass): caches {model, root} pairs per NPC (0.15s refresh
+-- cadence unchanged) instead of bare models, so collectTargets no longer
+-- runs rootOf() — up to 8 FindFirstChild calls — per NPC per slot per frame.
+-- Position is NOT cached: roots stay fresh, callers read .Position at use
+-- time. A pair whose root lost its parent (NPC died mid-cache) is skipped
+-- by the caller's guard.
 local function scanNPCs()
     local now = os.clock()
     if now - M1.npcsAt < 0.15 and #M1.npcs > 0 then return M1.npcs end
@@ -988,6 +1033,13 @@ local function ensureBox(slot, myChar, id)
     slot.box.CFrame = CFrame.new(r.Position)
 end
 
+-- OPTIMIZED (perf-pass): frame-scoped target cache keyed on (target, size).
+-- runMoves and runSlot(punch) scanning the same base with the same size in
+-- the same Heartbeat frame now share one result instead of re-scanning.
+-- The cache is cleared at the top of every Heartbeat (§13). Keys use the
+-- actual size value, so a slider change naturally misses. Still returns a
+-- plain array of models. Roots come from the scanNPCs pair cache; a root
+-- whose NPC died mid-cache (nil parent) is skipped.
 local _frameTargetsCache = {}
 
 local function collectTargets(slot)
@@ -1024,6 +1076,7 @@ local function bump(group)
 end
 
 local function fire(group, myChar, skillId, origin, targets, target, argMode, useDamage)
+    -- Re-resolve dead remotes instead of silently dropping every cast.
     if not remoteAlive(SkillRemote) then
         rebindRemotes(true)
         if not remoteAlive(SkillRemote) then return end
@@ -1080,6 +1133,11 @@ local function runSlot(slot, dt)
     if n > MAX_TICK then n = MAX_TICK end
     local targets = collectTargets(slot)
     if #targets == 0 then return end
+    -- OPTIMIZED (perf-pass): per-invocation castOrigin memo. The cache lives
+    -- only inside this runSlot call (slot, myChar and slot.origin are fixed
+    -- here), so no cross-slot leakage is possible. Within a synchronous
+    -- Heartbeat frame castOrigin is pure over (slot, myChar, target), so
+    -- repeated casts at the same target reuse one raycast instead of n.
     local originsCache = {}
     for _ = 1, n do
         slot.idx = slot.idx + 1
@@ -1112,6 +1170,8 @@ local function runMoves(dt)
     local active = {}
     for _, mv in ipairs(M1.moves.list) do if mv.on then active[#active + 1] = mv end end
     if #active == 0 then return end
+    -- OPTIMIZED (perf-pass): same per-invocation castOrigin memo as runSlot —
+    -- local to this runMoves call (base slot, myChar fixed), so no leakage.
     local originsCache = {}
     for _ = 1, n do
         M1.moves.idx = M1.moves.idx + 1
@@ -1315,6 +1375,7 @@ do
         callback = function()
             local n = moveNameInput.get()
             if n == "" then return end
+            -- Strip the prefix by length, never by magic numbers.
             if string.sub(n, 1, #AL_PREFIX) == AL_PREFIX then n = string.sub(n, #AL_PREFIX + 1) end
             if n == "" then
                 OJBS:Notify("empty move name", Color3.fromRGB(255, 110, 110))
@@ -1391,6 +1452,8 @@ do
         hookLastSeen = rn .. " → " .. tostring(arg)
     end
     local hookStatusNote = makeNote(pListen, "")
+    -- Token-gated: exits on cleanup (token bump) or when the note is
+    -- destroyed (lib teardown), instead of spinning forever.
     _statusLoopToken += 1
     local statusToken = _statusLoopToken
     task.spawn(function()
@@ -1810,6 +1873,8 @@ track(RunService.Heartbeat:Connect(function(dt)
         if getgenv().OJBS_App_Cleanup then pcall(getgenv().OJBS_App_Cleanup) end
         return
     end
+    -- OPTIMIZED (perf-pass): reset the frame-scoped target cache (§9) at the
+    -- top of every frame; collectTargets repopulates it on demand.
     table.clear(_frameTargetsCache)
     if TP.running and TP.dest then
         TP.acc += dt
@@ -1872,18 +1937,19 @@ task.defer(function()
     end
 end)
 
+-- UI starts CLOSED. Users open it with RightCtrl or the ⚙ toggle tab.
 OJBS:RailOpen(false)
 
 -- ================================================================
 -- 14. CLEANUP
 -- ================================================================
 local unloaded = false
-local _cleanupWrapper 
+local _cleanupWrapper  -- the wrapper actually stored in getgenv()
 local function doAppCleanup()
     if unloaded then return end
     unloaded = true
-    _remoteReminderToken += 1 
-    _statusLoopToken += 1   
+    _remoteReminderToken += 1  -- kill the reminder loop
+    _statusLoopToken += 1      -- kill the hook-status poller
     pcall(writeState)
     ListenOn = false
     pcall(uninstallHook)
